@@ -5,6 +5,15 @@
  *   2. LinkedIn job alert digests      -> parses listings, writes to `applications` (queued)
  *   3. Welcome to the Jungle job alert digests -> same as above
  *
+ * DETECTION NOTE: LinkedIn/WTTJ alerts are identified by the actual body
+ * content (presence of their distinctive job-link URL pattern), NOT by
+ * sender address or subject line. This is because a manually-forwarded
+ * email rewrites the sender to the forwarder (you) and prepends "Fwd:" to
+ * the subject -- confirmed from a real captured forward, where sender
+ * showed as afilous22@gmail.com with subject "Fwd: ...". Checking body
+ * content instead works regardless of how the email arrives (manual
+ * forward, Gmail auto-filter, etc.).
+ *
  * Env vars needed in Vercel project settings:
  *   SUPABASE_URL
  *   SUPABASE_ANON_KEY
@@ -54,8 +63,8 @@ function parseLinkedInJobs(html) {
   });
 }
 
-function isLinkedInAlert(sender, subject) {
-  return /jobalerts-noreply@linkedin\.com/i.test(sender);
+function isLinkedInAlert(sender, subject, html) {
+  return /linkedin\.com\/comm\/jobs\/view\//i.test(html || '');
 }
 
 function parseWTTJJobs(html) {
@@ -82,10 +91,8 @@ function parseWTTJJobs(html) {
   });
 }
 
-function isWTTJAlert(sender, subject) {
-  const senderMatch = /welcometothejungle\.com/i.test(sender);
-  const subjectMatch = /job|alert|opportunit|match/i.test(subject);
-  return senderMatch && subjectMatch;
+function isWTTJAlert(sender, subject, html) {
+  return /welcometothejungle\.com\/[a-z]{2}\/companies\//i.test(html || '');
 }
 
 async function insertQueuedJobs(jobs) {
@@ -133,14 +140,14 @@ module.exports = async (req, res) => {
         return;
       }
     }
-    if (isLinkedInAlert(sender, subject)) {
+    if (isLinkedInAlert(sender, subject, strippedHtml)) {
       const jobs = parseLinkedInJobs(strippedHtml);
       log(`  LinkedIn alert detected — parsed ${jobs.length} listing(s)`);
       const result = await insertQueuedJobs(jobs);
       res.status(200).json({ status: 'ok', source: 'linkedin', ...result });
       return;
     }
-    if (isWTTJAlert(sender, subject)) {
+    if (isWTTJAlert(sender, subject, strippedHtml)) {
       const jobs = parseWTTJJobs(strippedHtml);
       log(`  Welcome to the Jungle alert detected — parsed ${jobs.length} listing(s)`);
       const result = await insertQueuedJobs(jobs);
