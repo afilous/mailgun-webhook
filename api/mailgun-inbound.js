@@ -9,10 +9,18 @@
  * content (presence of their distinctive job-link URL pattern), NOT by
  * sender address or subject line. This is because a manually-forwarded
  * email rewrites the sender to the forwarder (you) and prepends "Fwd:" to
- * the subject -- confirmed from a real captured forward, where sender
- * showed as afilous22@gmail.com with subject "Fwd: ...". Checking body
- * content instead works regardless of how the email arrives (manual
- * forward, Gmail auto-filter, etc.).
+ * the subject -- confirmed from a real captured forward.
+ *
+ * PARSING NOTE (LinkedIn): title + URL come from the anchor with a
+ * "font-bold" class (the visible job title link). Company + location come
+ * from the "text-system-gray-100" <p> tag directly under each title --
+ * both confirmed stable against a real captured LinkedIn alert email.
+ * Titles and company lines appear in matching order, one pair per job
+ * card, so they're zipped by index rather than searched via a text
+ * window (an earlier version tried a window-based approach and a
+ * character-class that excluded parentheses, which silently failed on
+ * every listing since real company lines look like "Ladders · United
+ * States (Remote)").
  *
  * Env vars needed in Vercel project settings:
  *   SUPABASE_URL
@@ -42,19 +50,28 @@ function extractSecurityCode(text) {
 
 function parseLinkedInJobs(html) {
   if (!html) return [];
-  const jobs = [];
-  const linkPattern = /<a[^>]+href="(https:\/\/www\.linkedin\.com\/comm\/jobs\/view\/\d+[^"]*)"[^>]*>([^<]+)<\/a>/gi;
-  let match;
-  while ((match = linkPattern.exec(html)) !== null) {
-    const url = match[1].replace(/&amp;/g, '&');
-    const title = match[2].trim();
-    if (!title || title.length < 3) continue;
-    const windowStart = match.index + match[0].length;
-    const window = html.slice(windowStart, windowStart + 500);
-    const companyMatch = window.match(/<(?:span|p)[^>]*>([A-Za-z0-9&.,'\- ]{2,60})<\/(?:span|p)>/);
-    const company = companyMatch ? companyMatch[1].trim() : null;
-    jobs.push({ title, company, url, source: 'linkedin' });
+
+  const titlePattern = /<a[^>]+href="(https:\/\/www\.linkedin\.com\/comm\/jobs\/view\/\d+[^"]*)"[^>]*class="[^"]*font-bold[^"]*"[^>]*>\s*([^<]+?)\s*<\/a>/gi;
+  const companyPattern = /<p[^>]*class="[^"]*text-system-gray-100[^"]*"[^>]*>\s*([^<]+?)\s*<\/p>/gi;
+
+  const titles = [];
+  let m;
+  while ((m = titlePattern.exec(html)) !== null) {
+    titles.push({ url: m[1].replace(/&amp;/g, '&'), title: m[2].trim() });
   }
+
+  const companies = [];
+  while ((m = companyPattern.exec(html)) !== null) {
+    companies.push(m[1].trim());
+  }
+
+  const jobs = titles.map((t, i) => {
+    const raw = companies[i] || '';
+    const parts = raw.split(/\s*(?:&middot;|·)\s*/);
+    const company = parts[0] || null;
+    return { title: t.title, company, url: t.url, source: 'linkedin' };
+  });
+
   const seen = new Set();
   return jobs.filter((j) => {
     if (seen.has(j.url)) return false;
