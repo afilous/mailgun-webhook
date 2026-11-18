@@ -5,6 +5,9 @@
  *   2. LinkedIn job alert digests      -> parses listings, writes to `applications` (queued)
  *   3. Welcome to the Jungle job alert digests -> same as above
  *
+ * LinkedIn rows now also save: location, linkedin_job_id, alert_name, and a
+ * canonical https://www.linkedin.com/jobs/view/<id> url.
+ *
  * DETECTION NOTE: LinkedIn/WTTJ alerts are identified by the actual body
  * content (presence of their distinctive job-link URL pattern), NOT by
  * sender address or subject line. This is because a manually-forwarded
@@ -48,28 +51,54 @@ function extractSecurityCode(text) {
   return match ? match[1] : null;
 }
 
-function parseLinkedInJobs(html) {
+function decodeEntities(str) {
+  return String(str || '')
+    .replace(/&amp;/g, '&').replace(/&middot;/g, '·').replace(/&#183;/g, '·')
+    .replace(/&#39;|&apos;/g, "'").replace(/&quot;/g, '"').replace(/&nbsp;/g, ' ')
+    .replace(/\s+/g, ' ').trim();
+}
+
+// Canonical LinkedIn link: https://www.linkedin.com/jobs/view/<id>
+// (the email links carry a unique tracking id, which made every repeat alert a "new" row)
+function canonicalLinkedInUrl(url) {
+  const m = String(url).match(/linkedin\.com\/(?:comm\/)?jobs\/view\/(?:[^/?]*-)?(\d{6,})/i);
+  return m ? { id: m[1], url: `https://www.linkedin.com/jobs/view/${m[1]}` } : { id: null, url };
+}
+
+// "Your job alert for Business Operations Manager in San Jose"
+function extractAlertName(text) {
+  const m = String(text || '').match(/your job alert for\s+(.+?)\s*(?:\r?\n|$)/i);
+  return m ? m[1].trim().slice(0, 200) : null;
+}
+
+/**
+ * Parses one job card at a time: the visible title link ("font-bold" anchor),
+ * then the FIRST "text-system-gray-100" paragraph that follows it before the
+ * next title link. That paragraph looks like "Company · City, ST" or
+ * "Company · United States (Remote)". Extra lines in a card ("7 school
+ * alumni", "Fast growing") no longer shift later cards, which the old
+ * two-list zip approach was exposed to.
+ */
+function parseLinkedInJobs(html, alertName) {
   if (!html) return [];
 
   const titlePattern = /<a[^>]+href="(https:\/\/www\.linkedin\.com\/comm\/jobs\/view\/\d+[^"]*)"[^>]*class="[^"]*font-bold[^"]*"[^>]*>\s*([^<]+?)\s*<\/a>/gi;
-  const companyPattern = /<p[^>]*class="[^"]*text-system-gray-100[^"]*"[^>]*>\s*([^<]+?)\s*<\/p>/gi;
+  const companyPattern = /<p[^>]*class="[^"]*text-system-gray-100[^"]*"[^>]*>\s*([^<]+?)\s*<\/p>/i;
 
-  const titles = [];
+  const hits = [];
   let m;
   while ((m = titlePattern.exec(html)) !== null) {
-    titles.push({ url: m[1].replace(/&amp;/g, '&'), title: m[2].trim() });
+    hits.push({ rawUrl: m[1].replace(/&amp;/g, '&'), title: decodeEntities(m[2]), start: m.index, end: titlePattern.lastIndex });
   }
 
-  const companies = [];
-  while ((m = companyPattern.exec(html)) !== null) {
-    companies.push(m[1].trim());
-  }
-
-  const jobs = titles.map((t, i) => {
-    const raw = companies[i] || '';
-    const parts = raw.split(/\s*(?:&middot;|·)\s*/);
+  const jobs = hits.map((h, i) => {
+    const segment = html.slice(h.end, i + 1 < hits.length ? hits[i + 1].start : html.length);
+    const cm = segment.match(companyPattern);
+    const parts = cm ? decodeEntities(cm[1]).split(/\s*·\s*/) : [];
     const company = parts[0] || null;
-    return { title: t.title, company, url: t.url, source: 'linkedin' };
+    const location = parts.slice(1).join(', ') || null;
+    const { id, url } = canonicalLinkedInUrl(h.rawUrl);
+    return { title: h.title, company, location, url, linkedin_job_id: id, alert_name: alertName || null, source: 'linkedin' };
   });
 
   const seen = new Set();
@@ -114,14 +143,20 @@ function isWTTJAlert(sender, subject, html) {
 
 async function insertQueuedJobs(jobs) {
   if (!jobs.length) return { inserted: 0, errors: 0 };
-  const rows = jobs.map((j) => ({
-    company: j.company || 'Unknown',
-    job_title: j.title,
-    url: j.url,
-    status: 'queued',
-    source: j.source,
-    created_at: new Date().toISOString(),
-  }));
+  const rows = jobs.map((j) => {
+    const row = {
+      company: j.company || 'Unknown',
+      job_title: j.title,
+      url: j.url,
+      status: 'queued',
+      source: j.source,
+      created_at: new Date().toISOString(),
+    };
+    if (j.location) row.location = j.location;
+    if (j.linkedin_job_id) row.linkedin_job_id = j.linkedin_job_id;
+    if (j.alert_name) row.alert_name = j.alert_name;
+    return row;
+  });
   const { error, count } = await supabase
     .from('applications')
     .upsert(rows, { onConflict: 'url', ignoreDuplicates: true, count: 'exact' });
@@ -158,8 +193,11 @@ module.exports = async (req, res) => {
       }
     }
     if (isLinkedInAlert(sender, subject, strippedHtml)) {
-      const jobs = parseLinkedInJobs(strippedHtml);
-      log(`  LinkedIn alert detected — parsed ${jobs.length} listing(s)`);
+      const alertName = extractAlertName(bodyPlain) || extractAlertName(strippedText);
+      const jobs = parseLinkedInJobs(strippedHtml, alertName);
+      const linkCount = (strippedHtml.match(/linkedin\.com\/comm\/jobs\/view\//gi) || []).length;
+      log(`  LinkedIn alert detected — parsed ${jobs.length} listing(s) (alert: ${alertName || 'unknown'}, ${jobs.filter(j => j.location).length} with location)`);
+      if (jobs.length === 0 && linkCount > 0) log('  WARNING: job links present but none parsed — LinkedIn email markup may have changed');
       const result = await insertQueuedJobs(jobs);
       res.status(200).json({ status: 'ok', source: 'linkedin', ...result });
       return;
